@@ -1,19 +1,50 @@
 import os
+import sqlite3
 import stripe
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Stripe configuration
+# ------------------ Stripe Configuration ------------------
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 PRICE_ID = os.getenv("STRIPE_PRICE_ID")   # e.g. price_12345
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # starts with whsec_
-YOUR_DOMAIN = "https://dispatchify-backend-2.onrender.com"  # your Render domain
+YOUR_DOMAIN = "https://dispatchify-backend-2.onrender.com"  # Render domain
 
 print("🚀 Backend started")
 print(f"STRIPE_SECRET_KEY set? {'Yes' if stripe.api_key else 'No'}")
 print(f"PRICE_ID = {PRICE_ID}")
 print(f"WEBHOOK_SECRET set? {'Yes' if WEBHOOK_SECRET else 'No'}")
+
+# ------------------ Health Check ------------------
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Backend is running!"
+
+# ------------------ Login ------------------
+@app.route("/login", methods=["POST"])
+def login():
+    """Mock login — saves/returns email (no password)."""
+    data = request.get_json(silent=True) or {}
+    email = data.get("email")
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    # Optional: store in SQLite (for portal sessions)
+    conn = sqlite3.connect("users.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            stripe_customer_id TEXT
+        )
+    """)
+    cursor.execute("INSERT OR IGNORE INTO users (email) VALUES (?)", (email,))
+    conn.commit()
+    conn.close()
+
+    print(f"✅ User logged in: {email}")
+    return jsonify({"success": True, "email": email})
 
 # ------------------ Create Checkout Session ------------------
 @app.route("/create-checkout-session", methods=["POST"])
@@ -39,7 +70,7 @@ def create_checkout_session():
         return jsonify({"url": session.url})
 
     except Exception as e:
-        print(f"❌ Error creating checkout session: {str(e)}")  # <-- log exact error
+        print(f"❌ Error creating checkout session: {str(e)}")
         return jsonify(error=str(e)), 500
 
 # ------------------ Webhook ------------------
@@ -59,7 +90,15 @@ def stripe_webhook():
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         customer_email = session.get("customer_details", {}).get("email")
-        print(f"✅ New subscription from {customer_email}")
+        customer_id = session.get("customer")
+        print(f"✅ New subscription from {customer_email}, customer_id={customer_id}")
+
+        # Save Stripe customer ID in DB
+        conn = sqlite3.connect("users.db")
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET stripe_customer_id=? WHERE email=?", (customer_id, customer_email))
+        conn.commit()
+        conn.close()
 
     elif event["type"] == "invoice.payment_succeeded":
         sub = event["data"]["object"]["subscription"]
@@ -102,6 +141,7 @@ def check_subscription():
         print(f"❌ Error in /check-subscription: {e}")
         return jsonify({"subscribed": False, "error": str(e)}), 400
 
+# ------------------ Customer Portal ------------------
 @app.route("/create-portal-session", methods=["POST"])
 def create_portal_session():
     try:
@@ -121,10 +161,9 @@ def create_portal_session():
 
         customer_id = row[0]
 
-        # Stripe billing portal session
         session = stripe.billing_portal.Session.create(
             customer=customer_id,
-            return_url="https://dispatchify.com"  # change to your app website or Render frontend
+            return_url="https://dispatchify.com/settings"
         )
         return jsonify({"url": session.url})
 
@@ -140,6 +179,8 @@ def success():
 def cancel():
     return "❌ Subscription canceled. Please try again."
 
-# ------------------ Run locally ------------------
+# ------------------ Run ------------------
 if __name__ == "__main__":
-    app.run(port=4242, debug=True)
+    # Render requires 0.0.0.0 and PORT (defaults to 10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=True)
